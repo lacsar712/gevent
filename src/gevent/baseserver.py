@@ -8,6 +8,7 @@ import sys
 import _socket
 import errno
 
+from gevent import policy
 from gevent.greenlet import Greenlet
 from gevent.event import Event
 from gevent.hub import get_hub
@@ -402,7 +403,10 @@ class BaseServer(object):
         try:
             self._stop_event.wait()
         finally:
-            Greenlet.spawn(self.stop, timeout=stop_timeout).join()
+            # Shutdown bookkeeping; invisible to any policy frame on
+            # this greenlet (both the dispatch and its join).
+            with policy.unguarded():
+                Greenlet.spawn(self.stop, timeout=stop_timeout).join()
 
     def is_fatal_error(self, ex):
         return isinstance(ex, _socket.error) and ex.args[0] in self.fatal_errors

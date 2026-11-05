@@ -15,6 +15,7 @@ module add timeouts to arbitrary code.
 """
 from __future__ import absolute_import, print_function, division
 
+from gevent import policy
 from gevent._compat import string_types
 from gevent._util import _NONE
 
@@ -205,11 +206,16 @@ class Timeout(BaseException):
     # makes us larger.
 
     def __init__(self, seconds=None, exception=None, ref=True, priority=-1,
-                 _one_shot=False):
+                 _one_shot=False, _policy_skip=False):
         BaseException.__init__(self)
         self.seconds = seconds
         self.exception = exception
         self._one_shot = _one_shot
+        # Internal one-shots created for an already policy-governed wait
+        # (join/get/Event.wait/...) bypass the policy registry: their
+        # seconds are already the merged view and they cannot outlive the
+        # wait. Keeps the hot wait path allocation-free.
+        self._policy_skip = _policy_skip
         if seconds is None:
             # Avoid going through the timer codepath if no timeout is
             # desired; this avoids some CFFI interactions on PyPy that can lead to a
@@ -240,6 +246,27 @@ class Timeout(BaseException):
             # regular timeout with user-provided exception
             throws = self.exception
 
+        if self._policy_skip:
+            # Internal one-shot created for an already governed wait.
+            self.timer.start(self._on_expiration, getcurrent(), throws,
+                             update=True)
+            return
+
+        # Merge with the current greenlet's policy stack (freeze
+        # suspends the timer, shrink_now can tighten it). The timer
+        # object was allocated in __init__ with the configured seconds;
+        # when the frame shortens the delay we reallocate.
+        effective = policy.timeout_starting(self, self.seconds)
+        if effective is None:
+            # Suspended by a freeze frame; it will be resumed when the
+            # frame pops. Leave the native timer stopped.
+            return
+
+        if effective != self.seconds:
+            self.timer.stop()
+            self.timer.close()
+            self.timer = get_hub().loop.timer(effective or 0.0)
+
         # Make sure the timer updates the current time so that we don't
         # expire prematurely.
         self.timer.start(self._on_expiration, getcurrent(), throws, update=True)
@@ -249,7 +276,8 @@ class Timeout(BaseException):
         prev_greenlet.throw(ex)
 
     @classmethod
-    def start_new(cls, timeout=None, exception=None, ref=True, _one_shot=False):
+    def start_new(cls, timeout=None, exception=None, ref=True, _one_shot=False,
+                  _policy_skip=False):
         """Create a started :class:`Timeout`.
 
         This is a shortcut, the exact action depends on *timeout*'s type:
@@ -265,7 +293,8 @@ class Timeout(BaseException):
             if not timeout.pending:
                 timeout.start()
             return timeout
-        timeout = cls(timeout, exception, ref=ref, _one_shot=_one_shot)
+        timeout = cls(timeout, exception, ref=ref, _one_shot=_one_shot,
+                      _policy_skip=_policy_skip)
         timeout.start()
         return timeout
 
@@ -288,7 +317,8 @@ class Timeout(BaseException):
         # under PyPy in synthetic benchmarks it makes no difference.
         if timeout is None:
             return _FakeTimer
-        return Timeout.start_new(timeout, exception, ref, _one_shot=True)
+        return Timeout.start_new(timeout, exception, ref, _one_shot=True,
+                                 _policy_skip=True)
 
     @property
     def pending(self):
@@ -303,6 +333,8 @@ class Timeout(BaseException):
         you will not start the timeout again, you should use
         :meth:`close` instead.
         """
+        if not self._policy_skip:
+            policy.timeout_stopping(self)
         self.timer.stop()
         if self._one_shot:
             self.close()
@@ -312,6 +344,8 @@ class Timeout(BaseException):
         Close the timeout and free resources. The timer cannot be started again
         after this method has been used.
         """
+        if not self._policy_skip:
+            policy.timeout_stopping(self)
         self.timer.stop()
         self.timer.close()
         self.timer = _FakeTimer
@@ -378,6 +412,39 @@ class Timeout(BaseException):
                 return self.seconds < other
             except TypeError:
                 return NotImplemented
+
+def _throws_for(timeout):
+    if (timeout.exception is None
+            or timeout.exception is False
+            or isinstance(timeout.exception, string_types)):
+        # timeout that raises self
+        return timeout
+    # regular timeout with user-provided exception
+    return timeout.exception
+
+
+def _suspend_timeout(timeout):
+    """
+    Stop the native timer of *timeout* without closing it (policy
+    freeze support; the timer is either resumed by _rearm_timeout or
+    closed by cancel/close).
+    """
+    timeout.timer.stop()
+
+
+def _rearm_timeout(timeout, seconds, target):
+    """
+    Replace the native timer of *timeout* with one firing *seconds*
+    from now, aimed at *target* greenlet (policy stack support).
+    """
+    old = timeout.timer
+    old.stop()
+    old.close()
+    timer = get_hub().loop.timer(seconds or 0.0)
+    timeout.timer = timer
+    timer.start(timeout._on_expiration, target, _throws_for(timeout),
+                update=False)
+
 
 def with_timeout(seconds, function, *args, **kwds):
     """Wrap a call to *function* with a timeout; if the called

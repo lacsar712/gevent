@@ -10,6 +10,7 @@ import sys
 from greenlet import greenlet as RawGreenlet
 
 from gevent import monkey
+from gevent import policy
 from gevent._compat import integer_types
 from gevent.event import AsyncResult
 from gevent.exceptions import InvalidThreadUseError
@@ -525,7 +526,10 @@ class ThreadPool(GroupMappingMixin):
         if not self.manager and len(self._worker_greenlets) > self._maxsize:
             # might need to feed more Nones into the pool to shutdown
             # threads.
-            self.manager = Greenlet.spawn(self._adjust_wait)
+            # The manager is pool bookkeeping, invisible to any
+            # dispatch policy on the calling greenlet.
+            with policy.unguarded():
+                self.manager = Greenlet.spawn(self._adjust_wait)
 
     def _add_thread(self):
         self._WorkerGreenlet(self)
@@ -554,6 +558,10 @@ class ThreadPool(GroupMappingMixin):
         if self.hub != get_hub():
             raise InvalidThreadUseError
 
+        # Dispatch gate: reject before waiting for worker capacity so a
+        # deny_new/exhausted one_more frame never blocks on a full pool.
+        policy.spawn_precheck()
+
         while 1:
             semaphore = self._available_worker_threads_greenlet_sem
             semaphore.acquire()
@@ -572,15 +580,24 @@ class ThreadPool(GroupMappingMixin):
         # async watcher in this thread, because it uses this hub/loop,
         # which is not thread safe.
         thread_result = None
+        task = None
         try:
             thread_result = ThreadResult(result, self.hub, semaphore.release)
-            task_queue.put((func, args, kwargs, thread_result))
-            self.adjust()
+            task = (func, args, kwargs, thread_result)
+            task_queue.put(task)
+            # adjust() may spawn the internal manager greenlet;
+            # bookkeeping is invisible to the dispatch policy.
+            with policy.unguarded():
+                self.adjust()
         except:
             if thread_result is not None:
                 thread_result.destroy_in_main_thread()
             semaphore.release()
             raise
+        # Successful enqueue: reserve the one_more slot and register
+        # for exit reaping. Reads the live stack top.
+        policy.spawn_commit_thread_task(
+            self, result, task, thread_result, semaphore)
         return result
 
     def _apply_immediately(self):

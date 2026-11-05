@@ -79,6 +79,9 @@ spawn_later = Greenlet.spawn_later
 #: The singleton configuration object for gevent.
 
 from gevent.timeout import Timeout, with_timeout
+#: Per-greenlet dispatch/join runtime policy stacks
+#: (:mod:`gevent.policy`).
+from gevent import policy
 from gevent.hub import getcurrent, GreenletExit, spawn_raw, sleep, idle, kill, reinit
 try:
     from gevent.os import fork

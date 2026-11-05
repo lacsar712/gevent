@@ -75,6 +75,7 @@ from gevent._compat import PathLike
 from gevent._util import _NONE
 from gevent._util import copy_globals
 
+from gevent import policy
 from gevent.greenlet import Greenlet, joinall, killall
 spawn = Greenlet.spawn
 import subprocess as __subprocess__
@@ -1353,7 +1354,9 @@ class Popen(object):
         def rawlink(self, callback):
             if not self.result.ready() and not self._waiting:
                 self._waiting = True
-                Greenlet.spawn(self._wait)
+                # Internal reaper greenlet; not a user dispatch exit.
+                with policy.unguarded():
+                    Greenlet.spawn(self._wait)
             self.result.rawlink(linkproxy(callback, self))
             # XXX unlink
 
@@ -1364,7 +1367,10 @@ class Popen(object):
             return self.returncode
 
         def _wait(self):
-            self.threadpool.spawn(self._blocking_wait).rawlink(self.result)
+            # Internal process reaping; not a user dispatch exit.
+            with policy.unguarded():
+                task = self.threadpool.spawn(self._blocking_wait)
+            task.rawlink(self.result)
 
         def wait(self, timeout=None, _raise_exc=True):
             """Wait for child process to terminate.  Returns returncode

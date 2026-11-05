@@ -17,6 +17,7 @@ from __future__ import print_function, absolute_import, division
 
 
 from gevent.hub import GreenletExit, getcurrent, kill as _kill
+from gevent import policy
 from gevent.greenlet import joinall, Greenlet
 from gevent.queue import Full as QueueFull
 from gevent.timeout import Timeout
@@ -389,6 +390,10 @@ class Group(GroupMappingMixin):
 
         :return: The newly started greenlet.
         """
+        # Reject before constructing/tracking anything; this is a
+        # non-reserving read of the current stack top. The actual
+        # reservation (one_more) happens in Greenlet.start().
+        policy.spawn_precheck()
         greenlet = self.greenlet_class(*args, **kwargs)
         self.start(greenlet)
         return greenlet
@@ -426,16 +431,20 @@ class Group(GroupMappingMixin):
         .. versionchanged:: 1.2a1
            Add the return value.
         """
-        greenlets = list(self.greenlets) if raise_error else ()
-        result = self._empty_event.wait(timeout=timeout)
+        effective_timeout = policy.join_begin(timeout)
+        try:
+            greenlets = list(self.greenlets) if raise_error else ()
+            result = self._empty_event.wait(timeout=effective_timeout)
 
-        for greenlet in greenlets:
-            if greenlet.exception is not None:
-                if hasattr(greenlet, '_raise_exception'):
-                    greenlet._raise_exception()
-                raise greenlet.exception
+            for greenlet in greenlets:
+                if greenlet.exception is not None:
+                    if hasattr(greenlet, '_raise_exception'):
+                        greenlet._raise_exception()
+                    raise greenlet.exception
 
-        return result
+            return result
+        finally:
+            policy.join_end()
 
     def kill(self, exception=GreenletExit, block=True, timeout=None):
         """
@@ -633,6 +642,11 @@ class Pool(Group):
         ..  versionchanged:: 1.3.0 Added the ``blocking`` and
             ``timeout`` parameters.
         """
+        # The dispatch gate runs before the capacity wait so that
+        # deny_new/exhausted one_more frames reject immediately even
+        # when the pool is full (honor_cfg keeps the blocking/PoolFull
+        # semantics untouched).
+        policy.spawn_precheck()
         if not self._semaphore.acquire(blocking=blocking, timeout=timeout):
             # We failed to acquire the semaphore.
             # If blocking was True, then there was a timeout. If blocking was

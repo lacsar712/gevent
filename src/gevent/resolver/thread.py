@@ -5,6 +5,7 @@ Native thread-based hostname resolver.
 import _socket
 
 from gevent.hub import get_hub
+from gevent import policy
 
 
 __all__ = ['Resolver']
@@ -53,17 +54,23 @@ class Resolver(object):
     # from briefly reading socketmodule.c, it seems that all of the functions
     # below are thread-safe in Python, even if they are not thread-safe in C.
 
+    def _unguarded_apply(self, func, args=None, kwargs=None):
+        # DNS lookups are resolver bookkeeping, not a dispatch exit the
+        # caller chose: they must stay invisible to policy frames.
+        with policy.unguarded():
+            return self.pool.apply(func, args, kwargs)
+
     def gethostbyname(self, *args):
-        return self.pool.apply(_socket.gethostbyname, args)
+        return self._unguarded_apply(_socket.gethostbyname, args)
 
     def gethostbyname_ex(self, *args):
-        return self.pool.apply(_socket.gethostbyname_ex, args)
+        return self._unguarded_apply(_socket.gethostbyname_ex, args)
 
     def getaddrinfo(self, *args, **kwargs):
-        return self.pool.apply(_socket.getaddrinfo, args, kwargs)
+        return self._unguarded_apply(_socket.getaddrinfo, args, kwargs)
 
     def gethostbyaddr(self, *args, **kwargs):
-        return self.pool.apply(_socket.gethostbyaddr, args, kwargs)
+        return self._unguarded_apply(_socket.gethostbyaddr, args, kwargs)
 
     def getnameinfo(self, *args, **kwargs):
-        return self.pool.apply(_socket.getnameinfo, args, kwargs)
+        return self._unguarded_apply(_socket.getnameinfo, args, kwargs)

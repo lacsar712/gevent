@@ -23,6 +23,7 @@ from gevent._hub_primitives import iwait_on_objects as iwait
 from gevent._hub_primitives import wait_on_objects as wait
 
 from gevent.timeout import Timeout
+from gevent import policy
 
 from gevent._config import config as GEVENT_CONFIG
 from gevent._util import readproperty
@@ -622,9 +623,14 @@ class Greenlet(greenlet):
     def start(self):
         """Schedule the greenlet to run in this loop iteration"""
         if self._start_event is None:
+            # Merge with the dispatching greenlet's policy stack.
+            # This reads the current top; it never consults a
+            # snapshot captured earlier.
+            policy.spawn_precheck()
             _call_spawn_callbacks(self)
             hub = get_my_hub(self) # pylint:disable=undefined-variable
             self._start_event = hub.loop.run_callback(self.switch)
+            policy.spawn_commit_greenlet(self)
 
     def start_later(self, seconds):
         """
@@ -634,10 +640,15 @@ class Greenlet(greenlet):
         *seconds* later
         """
         if self._start_event is None:
+            # Admit the deferred dispatch on the calling greenlet's
+            # current stack (the timer callback itself runs on the
+            # hub and must not consult the hub's stack).
+            policy.spawn_precheck()
             _call_spawn_callbacks(self)
             hub = get_my_hub(self) # pylint:disable=undefined-variable
             self._start_event = hub.loop.timer(seconds)
             self._start_event.start(self.switch)
+            policy.spawn_commit_greenlet(self)
 
     @staticmethod
     def add_spawn_callback(callback):
@@ -812,8 +823,9 @@ class Greenlet(greenlet):
 
         switch = getcurrent().switch # pylint:disable=undefined-variable
         self.rawlink(switch)
+        effective_timeout = policy.join_begin(timeout)
         try:
-            t = Timeout._start_new_or_dummy(timeout)
+            t = Timeout._start_new_or_dummy(effective_timeout)
             try:
                 result = get_my_hub(self).switch() # pylint:disable=undefined-variable
                 if result is not self:
@@ -828,6 +840,8 @@ class Greenlet(greenlet):
             # did happen, the link would remain, causing another invalid switch later in this greenlet.
             self.unlink(switch)
             raise
+        finally:
+            policy.join_end()
 
         if self.ready():
             if self.successful():
@@ -846,8 +860,9 @@ class Greenlet(greenlet):
 
         switch = getcurrent().switch # pylint:disable=undefined-variable
         self.rawlink(switch)
+        effective_timeout = policy.join_begin(timeout)
         try:
-            t = Timeout._start_new_or_dummy(timeout)
+            t = Timeout._start_new_or_dummy(effective_timeout)
             try:
                 result = get_my_hub(self).switch() # pylint:disable=undefined-variable
                 if result is not self:
@@ -861,6 +876,8 @@ class Greenlet(greenlet):
         except:
             self.unlink(switch)
             raise
+        finally:
+            policy.join_end()
 
     def __enter__(self):
         return self
@@ -1081,18 +1098,22 @@ def joinall(greenlets, timeout=None, raise_error=False, count=None):
     :return: A sequence of the greenlets that finished before the timeout (if any)
         expired.
     """
-    if not raise_error:
-        return wait(greenlets, timeout=timeout, count=count)
+    effective_timeout = policy.join_begin(timeout)
+    try:
+        if not raise_error:
+            return wait(greenlets, timeout=effective_timeout, count=count)
 
-    done = []
-    for obj in iwait(greenlets, timeout=timeout, count=count):
-        if getattr(obj, 'exception', None) is not None:
-            if hasattr(obj, '_raise_exception'):
-                obj._raise_exception()
-            else:
-                raise obj.exception
-        done.append(obj)
-    return done
+        done = []
+        for obj in iwait(greenlets, timeout=effective_timeout, count=count):
+            if getattr(obj, 'exception', None) is not None:
+                if hasattr(obj, '_raise_exception'):
+                    obj._raise_exception()
+                else:
+                    raise obj.exception
+            done.append(obj)
+        return done
+    finally:
+        policy.join_end()
 
 
 def _killall3(greenlets, exception, waiter):
